@@ -29,12 +29,23 @@
 
 static std::atomic_bool g_stop{false};
 
-// 单次写入超过这个毫秒数，就认为它被写满的发送缓冲挡住了
-static constexpr double kBlockedWriteMs = 5.0;
+// 单次写入超过 1 ms，才认为是实际发送阻塞并计入补偿欠账。
+static constexpr double kBlockedWriteMs = 1.0;
 
-// 本次连接内累计“被挡住”的毫秒数
+// 本次连接内累计“实际阻塞”的毫秒数
 static double g_blockedMs = 0.0;
+static uint64_t g_writeCalls = 0;
+static uint64_t g_writeOver1MsCalls = 0;
+static double g_writeMaxMs = 0.0;
 static DWORD g_lastWinHttpError = ERROR_SUCCESS;
+
+static void ResetWriteStats()
+{
+    g_blockedMs = 0.0;
+    g_writeCalls = 0;
+    g_writeOver1MsCalls = 0;
+    g_writeMaxMs = 0.0;
+}
 
 // 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
 static constexpr double kDropBacklogMs = 60.0;
@@ -253,6 +264,127 @@ static std::wstring BuildAudioUrl(const std::wstring& originalUrl,
     return result;
 }
 
+static std::wstring BuildVolumeUrl(const UrlParts& source,
+                                   const wchar_t* volumePath)
+{
+    UrlParts parts = source;
+
+    if (parts.port == 8880)
+        parts.port = 8080;
+
+    parts.path = volumePath;
+
+    const std::wstring scheme =
+        parts.https ? L"https://" : L"http://";
+
+    std::wstring result = scheme + parts.host;
+
+    const bool defaultPort =
+        (parts.https &&
+         parts.port == INTERNET_DEFAULT_HTTPS_PORT) ||
+        (!parts.https &&
+         parts.port == INTERNET_DEFAULT_HTTP_PORT);
+
+    if (!defaultPort)
+        result += L":" + std::to_wstring(parts.port);
+
+    result += parts.path;
+    return result;
+}
+
+static bool SendVolumeRequest(const UrlParts& source,
+                              const wchar_t* volumePath)
+{
+    UrlParts parts = source;
+
+    if (parts.port == 8880)
+        parts.port = 8080;
+
+    parts.path = volumePath;
+
+    HINTERNET session = WinHttpOpen(
+        L"workdayAlarmClockGo/1.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+
+    if (!session) {
+        PrintWinError(L"WinHttpOpen(volume)");
+        return false;
+    }
+
+    WinHttpSetTimeouts(session, 1000, 1000, 1000, 1000);
+
+    HINTERNET connect = WinHttpConnect(
+        session,
+        parts.host.c_str(),
+        parts.port,
+        0);
+
+    if (!connect) {
+        PrintWinError(L"WinHttpConnect(volume)");
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(
+        connect,
+        L"GET",
+        parts.path.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        parts.https ? WINHTTP_FLAG_SECURE : 0);
+
+    if (!request) {
+        PrintWinError(L"WinHttpOpenRequest(volume)");
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    bool ok = false;
+
+    if (WinHttpSendRequest(
+            request,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0,
+            WINHTTP_NO_REQUEST_DATA,
+            0,
+            0,
+            0) &&
+        WinHttpReceiveResponse(request, nullptr)) {
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+
+        if (WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &status,
+                &statusSize,
+                WINHTTP_NO_HEADER_INDEX)) {
+            ok = (status >= 200 && status < 300);
+
+            if (!ok) {
+                std::wcerr
+                    << L"Volume request failed, HTTP status="
+                    << status
+                    << L"\n";
+            }
+        }
+    } else {
+        PrintWinError(L"Volume request");
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    return ok;
+}
+
 static bool ReadHttpResponse(HINTERNET request,
                               DWORD& status,
                               std::string& body,
@@ -365,6 +497,11 @@ static bool WriteRaw(HINTERNET request,
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - writeStart).count();
 
+        ++g_writeCalls;
+        if (writeMs >= 1.0)
+            ++g_writeOver1MsCalls;
+        g_writeMaxMs = std::max(g_writeMaxMs, writeMs);
+
         if (writeMs > kBlockedWriteMs)
             g_blockedMs += writeMs;
 
@@ -383,56 +520,11 @@ static bool WriteRaw(HINTERNET request,
     return true;
 }
 
-static bool WriteChunk(HINTERNET request,
-                       const BYTE* data,
-                       DWORD bytes)
+static bool WritePcm(HINTERNET request,
+                     const BYTE* data,
+                     DWORD bytes)
 {
-    char header[32];
-
-    const int headerLen =
-        sprintf_s(
-            header,
-            sizeof(header),
-            "%lX\r\n",
-            static_cast<unsigned long>(bytes));
-
-    if (headerLen <= 0)
-        return false;
-
-    // chunk size
-    if (!WriteRaw(
-            request,
-            reinterpret_cast<const BYTE*>(header),
-            static_cast<DWORD>(headerLen))) {
-        return false;
-    }
-
-    // chunk data
-    if (bytes > 0) {
-        if (!WriteRaw(request, data, bytes))
-            return false;
-    }
-
-    // trailing CRLF
-    static const BYTE crlf[] = {'\r', '\n'};
-
-    if (!WriteRaw(request, crlf, 2))
-        return false;
-
-    return true;
-}
-
-static bool EndChunkedRequest(HINTERNET request)
-{
-    static const BYTE end[] = {
-        '0', '\r', '\n',
-        '\r', '\n'
-    };
-
-    return WriteRaw(
-        request,
-        end,
-        sizeof(end));
+    return WriteRaw(request, data, bytes);
 }
 
 static int16_t FloatToS16(float value)
@@ -841,7 +933,7 @@ int wmain(int argc, wchar_t* argv[])
             if (!request) { PrintWinError(L"WinHttpOpenRequest"); closeHttp(); return false; }
             const wchar_t headers[] =
                 L"Content-Type: application/octet-stream\r\n"
-                L"Transfer-Encoding: chunked\r\n"
+                L"Content-Length: 68719476735\r\n"
                 L"Expect: 100-continue\r\n";
             if (!WinHttpSendRequest(
                     request, headers, static_cast<DWORD>(-1),
@@ -1347,11 +1439,11 @@ int wmain(int argc, wchar_t* argv[])
                     } else {
                         retryAfterDelay = true;
                     }
-                    g_blockedMs = 0.0;
+                    ResetWriteStats();
                     continue;
                 }
 
-                g_blockedMs = 0.0;
+                ResetWriteStats();
                 streamConfirmed = false;
                 successfulChunks = 0;
                 clearCompensation();
@@ -1361,8 +1453,28 @@ int wmain(int argc, wchar_t* argv[])
                     << L"HTTP connected; waiting for audio writes...\n";
             }
 
-            if (_kbhit() && _getch() == '\r') {
-                std::wcout << L"Reconnect requested; flushing capture and refreshing audio output device.\n";
+            if (_kbhit()) {
+                const int key = _getch();
+
+                // Windows 控制台方向键：0/224 后跟具体键值，↑=72，↓=80。
+                if (key == 0 || key == 224) {
+                    const int arrow = _getch();
+
+                    if (arrow == 72) {
+                        if (SendVolumeRequest(activeParts, L"/volp")) {
+                            std::wcout << L"Volume up.\n";
+                        }
+                    } else if (arrow == 80) {
+                        if (SendVolumeRequest(activeParts, L"/volm")) {
+                            std::wcout << L"Volume down.\n";
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (key == '\r') {
+                    std::wcout << L"Reconnect requested; flushing capture and refreshing audio output device.\n";
                 closeHttp();
                 connected = false;
                 streamConfirmed = false;
@@ -1385,8 +1497,9 @@ int wmain(int argc, wchar_t* argv[])
                 clearCompensation();
                 haveLastCongestionTime = false;
                 avgCongestionIntervalMs = kInitialCongestionIntervalMs;
-                g_blockedMs = 0.0;
+                ResetWriteStats();
                 continue;
+                }
             }
 
             UINT32 packetFrames = 0;
@@ -1471,7 +1584,7 @@ int wmain(int argc, wchar_t* argv[])
                                             ? left
                                             : static_cast<DWORD>(sizeof(zeroBuffer));
 
-                                    if (!WriteChunk(request, zeroBuffer, chunk)) {
+                                    if (!WritePcm(request, zeroBuffer, chunk)) {
                                         connected = false;
                                         break;
                                     }
@@ -1496,7 +1609,7 @@ int wmain(int argc, wchar_t* argv[])
                                         pcm16)) {
                                     std::wcerr << L"PCM conversion failed.\n";
                                     connected = false;
-                                } else if (!WriteChunk(
+                                } else if (!WritePcm(
                                                request,
                                                reinterpret_cast<const BYTE*>(pcm16.data()),
                                                outputBytes)) {
@@ -1555,7 +1668,7 @@ int wmain(int argc, wchar_t* argv[])
                                     ? left
                                     : static_cast<DWORD>(sizeof(zeroBuffer));
 
-                            if (!WriteChunk(request, zeroBuffer, chunk)) {
+                            if (!WritePcm(request, zeroBuffer, chunk)) {
                                 connected = false;
                                 break;
                             }
@@ -1580,7 +1693,7 @@ int wmain(int argc, wchar_t* argv[])
                                 pcm16)) {
                             std::wcerr << L"PCM conversion failed.\n";
                             connected = false;
-                        } else if (!WriteChunk(
+                        } else if (!WritePcm(
                                        request,
                                        reinterpret_cast<const BYTE*>(pcm16.data()),
                                        outputBytes)) {
@@ -1606,8 +1719,8 @@ int wmain(int argc, wchar_t* argv[])
                 if (!connected || g_stop.load())
                     break;
 
-                // 网络写入累计阻塞达到阈值时，不断开连接。
-                // 把阻塞时间转换成历史音频欠账，然后重新计算一张“发送/丢弃”时间轴。
+                // 连续 PCM body 的写入累计达到阈值时，不断开连接。
+                // 把 WriteData 耗时转换成历史音频欠账，然后重新计算一张“发送/丢弃”时间轴。
                 if (g_blockedMs >= kDropBacklogMs) {
                     const double dropMs = g_blockedMs;
                     const auto now = std::chrono::steady_clock::now();
@@ -1648,6 +1761,11 @@ int wmain(int argc, wchar_t* argv[])
                     const bool dropAll =
                         backlogMs >= kDropAllBacklogMs;
 
+                    const double averageWriteMs =
+                        g_writeCalls > 0
+                            ? dropMs / static_cast<double>(g_writeCalls)
+                            : 0.0;
+
                     std::wcout
                         << L"Network congested (writes blocked "
                         << static_cast<long long>(dropMs)
@@ -1657,9 +1775,17 @@ int wmain(int argc, wchar_t* argv[])
                         << (dropAll
                                 ? L"full drop of old audio."
                                 : L"5 ms send/drop schedule.")
+                        << L"; WriteData calls="
+                        << g_writeCalls
+                        << L", avg="
+                        << averageWriteMs
+                        << L" ms, max="
+                        << g_writeMaxMs
+                        << L" ms, >=1ms="
+                        << g_writeOver1MsCalls
                         << L"\n";
 
-                    g_blockedMs = 0.0;
+                    ResetWriteStats();
                 }
 
                 hr = captureClient->GetNextPacketSize(
@@ -1770,34 +1896,8 @@ int wmain(int argc, wchar_t* argv[])
 
         audioClient->Stop();
 
-        // 结束 chunked request
-        if (connected && request) {
-            EndChunkedRequest(request);
-            if (WinHttpReceiveResponse(
-                    request,
-                    nullptr)) {
-
-                DWORD status = 0;
-                DWORD statusSize =
-                    sizeof(status);
-
-                if (WinHttpQueryHeaders(
-                        request,
-                        WINHTTP_QUERY_STATUS_CODE |
-                            WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX,
-                        &status,
-                        &statusSize,
-                        WINHTTP_NO_HEADER_INDEX)) {
-
-                    std::wcout
-                        << L"HTTP status: "
-                        << status
-                        << L"\n";
-                }
-            }
-        }
-
+        // 连续 PCM body 使用长 Content-Length，不发送 chunk 结束标记。
+        // 停止/重连时直接关闭请求，服务端会结束当前 body。
         closeHttp();
 
     } while (false);
