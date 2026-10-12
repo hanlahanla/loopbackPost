@@ -66,8 +66,24 @@ static void PrintHr(const wchar_t* where, HRESULT hr);
 // using the legacy IAudioClient initialization below.
 static bool InitializeLowLatencyLoopback(IMMDevice* device,
                                          IAudioClient** audioClient,
-                                         const WAVEFORMATEX* format)
+                                         const WAVEFORMATEX* format,
+                                         HANDLE audioEvent)
 {
+    const auto reactivateAudioClient = [&]() -> bool {
+        if (*audioClient) {
+            (*audioClient)->Release();
+            *audioClient = nullptr;
+        }
+        const HRESULT activateHr = device->Activate(
+            __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(audioClient));
+        if (FAILED(activateHr)) {
+            PrintHr(L"IMMDevice::Activate(IAudioClient,fallback)", activateHr);
+            return false;
+        }
+        return true;
+    };
+
     IAudioClient3* audioClient3 = nullptr;
     HRESULT hr = (*audioClient)->QueryInterface(
         __uuidof(IAudioClient3),
@@ -96,13 +112,22 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
 
             if (periodFrames >= minPeriod && periodFrames <= maxPeriod) {
                 hr = audioClient3->InitializeSharedAudioStream(
-                    AUDCLNT_STREAMFLAGS_LOOPBACK,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK |
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                     periodFrames,
                     format,
                     nullptr);
                 if (SUCCEEDED(hr)) {
+                    hr = (*audioClient)->SetEventHandle(audioEvent);
+                    if (FAILED(hr)) {
+                        PrintHr(L"IAudioClient::SetEventHandle(IAudioClient3)", hr);
+                        audioClient3->Release();
+                        if (!reactivateAudioClient())
+                            return false;
+                        goto legacy_fallback;
+                    }
                     std::wcout
-                        << L"IAudioClient3 shared loopback period: "
+                        << L"IAudioClient3 event-driven loopback period: "
                         << (static_cast<uint64_t>(periodFrames) * 1000 /
                             format->nSamplesPerSec)
                         << L" ms (minimum "
@@ -126,19 +151,13 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
 
         // Initialize failure may leave the client unusable. Re-activate it
         // before falling back to the legacy shared-mode initialization.
-        (*audioClient)->Release();
-        *audioClient = nullptr;
-        hr = device->Activate(
-            __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-            reinterpret_cast<void**>(audioClient));
-        if (FAILED(hr)) {
-            PrintHr(L"IMMDevice::Activate(IAudioClient,fallback)", hr);
+        if (!reactivateAudioClient())
             return false;
-        }
     } else if (hr != E_NOINTERFACE) {
         PrintHr(L"QueryInterface(IAudioClient3)", hr);
     }
 
+legacy_fallback:
     REFERENCE_TIME defaultPeriod = 0;
     REFERENCE_TIME minPeriod = 0;
     hr = (*audioClient)->GetDevicePeriod(&defaultPeriod, &minPeriod);
@@ -150,17 +169,52 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
         ((targetDuration + defaultPeriod - 1) / defaultPeriod) * defaultPeriod;
     hr = (*audioClient)->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_STREAMFLAGS_LOOPBACK |
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         bufferDuration,
         0,
         format,
         nullptr);
     if (FAILED(hr)) {
         PrintHr(L"IAudioClient::Initialize(loopback,fallback)", hr);
-        return false;
+        if (!reactivateAudioClient())
+            return false;
+        hr = (*audioClient)->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            bufferDuration,
+            0,
+            format,
+            nullptr);
+        if (FAILED(hr)) {
+            PrintHr(L"IAudioClient::Initialize(loopback,polling fallback)", hr);
+            return false;
+        }
+        std::wcout << L"Event-driven capture unavailable; using polling fallback.\n";
+        return true;
+    }
+    hr = (*audioClient)->SetEventHandle(audioEvent);
+    if (FAILED(hr)) {
+        PrintHr(L"IAudioClient::SetEventHandle(loopback fallback)", hr);
+        if (!reactivateAudioClient())
+            return false;
+        hr = (*audioClient)->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK,
+            bufferDuration,
+            0,
+            format,
+            nullptr);
+        if (FAILED(hr)) {
+            PrintHr(L"IAudioClient::Initialize(loopback,polling fallback)", hr);
+            return false;
+        }
+        std::wcout << L"Event handle unavailable; using polling fallback.\n";
+        return true;
     }
     std::wcout << L"IAudioClient fallback capture buffer request: "
-               << bufferDuration / 10000 << L" ms\n";
+               << bufferDuration / 10000
+               << L" ms (event-driven, 5 ms polling safety fallback)\n";
     return true;
 }
 
@@ -1186,6 +1240,13 @@ int wmain(int argc, wchar_t* argv[])
     IAudioClient* audioClient = nullptr;
     IAudioCaptureClient* captureClient = nullptr;
     WAVEFORMATEX* format = nullptr;
+    HANDLE audioCaptureEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!audioCaptureEvent) {
+        PrintWinError(L"CreateEventW(audio capture)");
+        CoUninitialize();
+        SetConsoleCtrlHandler(ConsoleHandler, FALSE);
+        return 1;
+    }
 
     bool ok = false;
     bool keyboardHookStarted = false;
@@ -1401,6 +1462,7 @@ int wmain(int argc, wchar_t* argv[])
                 PrintHr(L"IAudioClient::Reset(reconnect)", hr);
                 return false;
             }
+            ResetEvent(audioCaptureEvent);
 
             return true;
         };
@@ -1409,6 +1471,7 @@ int wmain(int argc, wchar_t* argv[])
             if (!audioClient)
                 return false;
 
+            ResetEvent(audioCaptureEvent);
             hr = audioClient->Start();
             if (FAILED(hr)) {
                 PrintHr(L"IAudioClient::Start(reconnect)", hr);
@@ -1516,7 +1579,8 @@ int wmain(int argc, wchar_t* argv[])
             if (finalUrl.empty() || !CrackUrl(finalUrl, finalParts))
                 return false;
 
-            if (!InitializeLowLatencyLoopback(device, &audioClient, format)) {
+            if (!InitializeLowLatencyLoopback(
+                    device, &audioClient, format, audioCaptureEvent)) {
                 return false;
             }
 
@@ -1547,7 +1611,8 @@ int wmain(int argc, wchar_t* argv[])
             return true;
         };
 
-        if (!InitializeLowLatencyLoopback(device, &audioClient, format)) {
+        if (!InitializeLowLatencyLoopback(
+                device, &audioClient, format, audioCaptureEvent)) {
             break;
         }
 
@@ -1892,6 +1957,16 @@ int wmain(int argc, wchar_t* argv[])
                 }
             }
 
+            // The event wakes immediately when loopback data is ready. A short
+            // timeout keeps console controls responsive and polls as a fallback
+            // on older Windows builds whose loopback events are not delivered.
+            const DWORD audioWait = WaitForSingleObject(audioCaptureEvent, 5);
+            if (audioWait == WAIT_FAILED) {
+                PrintWinError(L"WaitForSingleObject(audio capture event)");
+                connected = false;
+                break;
+            }
+
             UINT32 packetFrames = 0;
 
             hr = captureClient->GetNextPacketSize(
@@ -1906,8 +1981,6 @@ int wmain(int argc, wchar_t* argv[])
             }
 
             if (packetFrames == 0) {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(5));
                 continue;
             }
 
@@ -2317,6 +2390,9 @@ int wmain(int argc, wchar_t* argv[])
 
     if (request)
         WinHttpCloseHandle(request);
+
+    if (audioCaptureEvent)
+        CloseHandle(audioCaptureEvent);
 
     if (connect)
         WinHttpCloseHandle(connect);
