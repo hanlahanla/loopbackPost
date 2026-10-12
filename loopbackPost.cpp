@@ -59,6 +59,111 @@ static void ResetWriteStats()
     g_writeMaxMs = 0.0;
 }
 
+static void PrintHr(const wchar_t* where, HRESULT hr);
+
+// Ask the Windows audio engine for a short shared-mode loopback period.
+// IAudioClient3 is available on Windows 10 1607 and later; older systems keep
+// using the legacy IAudioClient initialization below.
+static bool InitializeLowLatencyLoopback(IMMDevice* device,
+                                         IAudioClient** audioClient,
+                                         const WAVEFORMATEX* format)
+{
+    IAudioClient3* audioClient3 = nullptr;
+    HRESULT hr = (*audioClient)->QueryInterface(
+        __uuidof(IAudioClient3),
+        reinterpret_cast<void**>(&audioClient3));
+
+    if (SUCCEEDED(hr) && audioClient3) {
+        UINT32 defaultPeriod = 0;
+        UINT32 fundamentalPeriod = 0;
+        UINT32 minPeriod = 0;
+        UINT32 maxPeriod = 0;
+        hr = audioClient3->GetSharedModeEnginePeriod(
+            format, &defaultPeriod, &fundamentalPeriod,
+            &minPeriod, &maxPeriod);
+
+        if (SUCCEEDED(hr) && fundamentalPeriod > 0 && minPeriod <= maxPeriod) {
+            constexpr UINT32 kTargetPeriodMs = 5;
+            const UINT32 targetFrames = static_cast<UINT32>(
+                (static_cast<uint64_t>(format->nSamplesPerSec) *
+                 kTargetPeriodMs + 999) / 1000);
+            UINT32 periodFrames = std::max(minPeriod, targetFrames);
+            const UINT32 remainder = periodFrames % fundamentalPeriod;
+            if (remainder != 0)
+                periodFrames += fundamentalPeriod - remainder;
+            if (periodFrames > maxPeriod)
+                periodFrames = maxPeriod - (maxPeriod % fundamentalPeriod);
+
+            if (periodFrames >= minPeriod && periodFrames <= maxPeriod) {
+                hr = audioClient3->InitializeSharedAudioStream(
+                    AUDCLNT_STREAMFLAGS_LOOPBACK,
+                    periodFrames,
+                    format,
+                    nullptr);
+                if (SUCCEEDED(hr)) {
+                    std::wcout
+                        << L"IAudioClient3 shared loopback period: "
+                        << (static_cast<uint64_t>(periodFrames) * 1000 /
+                            format->nSamplesPerSec)
+                        << L" ms (minimum "
+                        << (static_cast<uint64_t>(minPeriod) * 1000 /
+                            format->nSamplesPerSec)
+                        << L" ms, default "
+                        << (static_cast<uint64_t>(defaultPeriod) * 1000 /
+                            format->nSamplesPerSec)
+                        << L" ms)\n";
+                    audioClient3->Release();
+                    return true;
+                }
+                PrintHr(L"IAudioClient3::InitializeSharedAudioStream", hr);
+            }
+        } else if (FAILED(hr)) {
+            PrintHr(L"IAudioClient3::GetSharedModeEnginePeriod", hr);
+        } else {
+            std::wcerr << L"IAudioClient3 returned an invalid shared-mode period range.\n";
+        }
+        audioClient3->Release();
+
+        // Initialize failure may leave the client unusable. Re-activate it
+        // before falling back to the legacy shared-mode initialization.
+        (*audioClient)->Release();
+        *audioClient = nullptr;
+        hr = device->Activate(
+            __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(audioClient));
+        if (FAILED(hr)) {
+            PrintHr(L"IMMDevice::Activate(IAudioClient,fallback)", hr);
+            return false;
+        }
+    } else if (hr != E_NOINTERFACE) {
+        PrintHr(L"QueryInterface(IAudioClient3)", hr);
+    }
+
+    REFERENCE_TIME defaultPeriod = 0;
+    REFERENCE_TIME minPeriod = 0;
+    hr = (*audioClient)->GetDevicePeriod(&defaultPeriod, &minPeriod);
+    if (FAILED(hr) || defaultPeriod <= 0)
+        defaultPeriod = 100000;
+
+    constexpr REFERENCE_TIME targetDuration = 300000;
+    const REFERENCE_TIME bufferDuration =
+        ((targetDuration + defaultPeriod - 1) / defaultPeriod) * defaultPeriod;
+    hr = (*audioClient)->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        bufferDuration,
+        0,
+        format,
+        nullptr);
+    if (FAILED(hr)) {
+        PrintHr(L"IAudioClient::Initialize(loopback,fallback)", hr);
+        return false;
+    }
+    std::wcout << L"IAudioClient fallback capture buffer request: "
+               << bufferDuration / 10000 << L" ms\n";
+    return true;
+}
+
 // 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
 static double kDropBacklogMs = 60.0;
 
@@ -1411,32 +1516,7 @@ int wmain(int argc, wchar_t* argv[])
             if (finalUrl.empty() || !CrackUrl(finalUrl, finalParts))
                 return false;
 
-            REFERENCE_TIME defaultPeriod = 0;
-            REFERENCE_TIME minPeriod = 0;
-
-            hr = audioClient->GetDevicePeriod(
-                &defaultPeriod,
-                &minPeriod);
-
-            if (FAILED(hr) || defaultPeriod <= 0)
-                defaultPeriod = 100000;
-
-            constexpr REFERENCE_TIME targetDuration = 300000;
-
-            const REFERENCE_TIME bufferDuration =
-                ((targetDuration + defaultPeriod - 1) / defaultPeriod) *
-                defaultPeriod;
-
-            hr = audioClient->Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                bufferDuration,
-                0,
-                format,
-                nullptr);
-
-            if (FAILED(hr)) {
-                PrintHr(L"IAudioClient::Initialize(loopback,reconnect)", hr);
+            if (!InitializeLowLatencyLoopback(device, &audioClient, format)) {
                 return false;
             }
 
@@ -1467,41 +1547,7 @@ int wmain(int argc, wchar_t* argv[])
             return true;
         };
 
-        // 共享模式下缓冲最终由音频引擎决定，我们只能“申请目标值”。
-        // 先问一下引擎周期，按它的整数倍去申请，免得因为没对齐被拒绝。
-        REFERENCE_TIME defaultPeriod = 0;
-        REFERENCE_TIME minPeriod = 0;
-
-        hr = audioClient->GetDevicePeriod(&defaultPeriod, &minPeriod);
-
-        if (FAILED(hr) || defaultPeriod <= 0)
-            defaultPeriod = 100000; // 问不到就按 10 ms 兜底
-
-        constexpr REFERENCE_TIME targetDuration = 300000; // 想要 30 ms
-
-        const REFERENCE_TIME bufferDuration =
-            ((targetDuration + defaultPeriod - 1) / defaultPeriod) *
-            defaultPeriod;
-
-        std::wcout
-            << L"Engine period: "
-            << defaultPeriod / 10000
-            << L" ms, requesting capture buffer: "
-            << bufferDuration / 10000
-            << L" ms\n";
-
-        hr = audioClient->Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK,
-            bufferDuration,
-            0,
-            format,
-            nullptr);
-
-        if (FAILED(hr)) {
-            PrintHr(
-                L"IAudioClient::Initialize(loopback)",
-                hr);
+        if (!InitializeLowLatencyLoopback(device, &audioClient, format)) {
             break;
         }
 
