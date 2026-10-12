@@ -67,15 +67,37 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
                                          const WAVEFORMATEX* format,
                                          HANDLE audioEvent)
 {
-    REFERENCE_TIME defaultPeriod = 0;
-    REFERENCE_TIME minPeriod = 0;
-    HRESULT hr = (*audioClient)->GetDevicePeriod(&defaultPeriod, &minPeriod);
-    if (FAILED(hr) || defaultPeriod <= 0)
-        defaultPeriod = 100000;
+    constexpr REFERENCE_TIME fallbackDuration = 50000; // 5 ms
+    REFERENCE_TIME bufferDuration = fallbackDuration;
+    UINT32 minPeriodFrames = 0;
+    UINT32 defaultPeriodFrames = 0;
 
-    constexpr REFERENCE_TIME targetDuration = 50000; // 5 ms target
-    const REFERENCE_TIME bufferDuration =
-        ((targetDuration + defaultPeriod - 1) / defaultPeriod) * defaultPeriod;
+    IAudioClient3* audioClient3 = nullptr;
+    HRESULT hr = (*audioClient)->QueryInterface(
+        __uuidof(IAudioClient3),
+        reinterpret_cast<void**>(&audioClient3));
+    if (SUCCEEDED(hr) && audioClient3) {
+        UINT32 fundamentalPeriodFrames = 0;
+        UINT32 maxPeriodFrames = 0;
+        hr = audioClient3->GetSharedModeEnginePeriod(
+            format,
+            &defaultPeriodFrames,
+            &fundamentalPeriodFrames,
+            &minPeriodFrames,
+            &maxPeriodFrames);
+        if (SUCCEEDED(hr) && minPeriodFrames > 0 &&
+            format->nSamplesPerSec > 0) {
+            bufferDuration = static_cast<REFERENCE_TIME>(
+                (static_cast<uint64_t>(minPeriodFrames) * 10000000ULL +
+                 format->nSamplesPerSec - 1) /
+                format->nSamplesPerSec);
+        } else if (FAILED(hr)) {
+            PrintHr(L"IAudioClient3::GetSharedModeEnginePeriod", hr);
+        }
+        audioClient3->Release();
+    } else if (hr != E_NOINTERFACE) {
+        PrintHr(L"QueryInterface(IAudioClient3)", hr);
+    }
 
     const auto reactivateAudioClient = [&]() -> bool {
         (*audioClient)->Release();
@@ -135,9 +157,17 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
         std::wcout << L"Event handle unavailable; using polling fallback.\n";
         return true;
     }
-    std::wcout << L"Event-driven loopback capture; requesting "
-               << bufferDuration / 10000
-               << L" ms buffer (5 ms target, aligned to engine period)\n";
+    std::wcout << L"Event-driven loopback capture; ";
+    if (minPeriodFrames > 0) {
+        std::wcout << L"IAudioClient3 minimum shared period: "
+                   << (static_cast<double>(minPeriodFrames) * 1000.0 /
+                       format->nSamplesPerSec)
+                   << L" ms, requested buffer: ";
+    } else {
+        std::wcout << L"IAudioClient3 period query unavailable, requesting ";
+    }
+    std::wcout << (static_cast<double>(bufferDuration) / 10000.0)
+               << L" ms\n";
     return true;
 }
 
