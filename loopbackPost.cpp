@@ -61,112 +61,35 @@ static void ResetWriteStats()
 
 static void PrintHr(const wchar_t* where, HRESULT hr);
 
-// Ask the Windows audio engine for a short shared-mode loopback period.
-// IAudioClient3 is available on Windows 10 1607 and later; older systems keep
-// using the legacy IAudioClient initialization below.
+// Configure short-period, event-driven shared-mode loopback capture.
 static bool InitializeLowLatencyLoopback(IMMDevice* device,
                                          IAudioClient** audioClient,
                                          const WAVEFORMATEX* format,
                                          HANDLE audioEvent)
 {
+    REFERENCE_TIME defaultPeriod = 0;
+    REFERENCE_TIME minPeriod = 0;
+    HRESULT hr = (*audioClient)->GetDevicePeriod(&defaultPeriod, &minPeriod);
+    if (FAILED(hr) || defaultPeriod <= 0)
+        defaultPeriod = 100000;
+
+    constexpr REFERENCE_TIME targetDuration = 50000; // 5 ms target
+    const REFERENCE_TIME bufferDuration =
+        ((targetDuration + defaultPeriod - 1) / defaultPeriod) * defaultPeriod;
+
     const auto reactivateAudioClient = [&]() -> bool {
-        if (*audioClient) {
-            (*audioClient)->Release();
-            *audioClient = nullptr;
-        }
+        (*audioClient)->Release();
+        *audioClient = nullptr;
         const HRESULT activateHr = device->Activate(
             __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
             reinterpret_cast<void**>(audioClient));
         if (FAILED(activateHr)) {
-            PrintHr(L"IMMDevice::Activate(IAudioClient,fallback)", activateHr);
+            PrintHr(L"IMMDevice::Activate(IAudioClient,polling fallback)", activateHr);
             return false;
         }
         return true;
     };
 
-    IAudioClient3* audioClient3 = nullptr;
-    HRESULT hr = (*audioClient)->QueryInterface(
-        __uuidof(IAudioClient3),
-        reinterpret_cast<void**>(&audioClient3));
-
-    if (SUCCEEDED(hr) && audioClient3) {
-        UINT32 defaultPeriod = 0;
-        UINT32 fundamentalPeriod = 0;
-        UINT32 minPeriod = 0;
-        UINT32 maxPeriod = 0;
-        hr = audioClient3->GetSharedModeEnginePeriod(
-            format, &defaultPeriod, &fundamentalPeriod,
-            &minPeriod, &maxPeriod);
-
-        if (SUCCEEDED(hr) && fundamentalPeriod > 0 && minPeriod <= maxPeriod) {
-            constexpr UINT32 kTargetPeriodMs = 5;
-            const UINT32 targetFrames = static_cast<UINT32>(
-                (static_cast<uint64_t>(format->nSamplesPerSec) *
-                 kTargetPeriodMs + 999) / 1000);
-            UINT32 periodFrames = std::max(minPeriod, targetFrames);
-            const UINT32 remainder = periodFrames % fundamentalPeriod;
-            if (remainder != 0)
-                periodFrames += fundamentalPeriod - remainder;
-            if (periodFrames > maxPeriod)
-                periodFrames = maxPeriod - (maxPeriod % fundamentalPeriod);
-
-            if (periodFrames >= minPeriod && periodFrames <= maxPeriod) {
-                hr = audioClient3->InitializeSharedAudioStream(
-                    AUDCLNT_STREAMFLAGS_LOOPBACK |
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    periodFrames,
-                    format,
-                    nullptr);
-                if (SUCCEEDED(hr)) {
-                    hr = (*audioClient)->SetEventHandle(audioEvent);
-                    if (FAILED(hr)) {
-                        PrintHr(L"IAudioClient::SetEventHandle(IAudioClient3)", hr);
-                        audioClient3->Release();
-                        if (!reactivateAudioClient())
-                            return false;
-                        goto legacy_fallback;
-                    }
-                    std::wcout
-                        << L"IAudioClient3 event-driven loopback period: "
-                        << (static_cast<uint64_t>(periodFrames) * 1000 /
-                            format->nSamplesPerSec)
-                        << L" ms (minimum "
-                        << (static_cast<uint64_t>(minPeriod) * 1000 /
-                            format->nSamplesPerSec)
-                        << L" ms, default "
-                        << (static_cast<uint64_t>(defaultPeriod) * 1000 /
-                            format->nSamplesPerSec)
-                        << L" ms)\n";
-                    audioClient3->Release();
-                    return true;
-                }
-                PrintHr(L"IAudioClient3::InitializeSharedAudioStream", hr);
-            }
-        } else if (FAILED(hr)) {
-            PrintHr(L"IAudioClient3::GetSharedModeEnginePeriod", hr);
-        } else {
-            std::wcerr << L"IAudioClient3 returned an invalid shared-mode period range.\n";
-        }
-        audioClient3->Release();
-
-        // Initialize failure may leave the client unusable. Re-activate it
-        // before falling back to the legacy shared-mode initialization.
-        if (!reactivateAudioClient())
-            return false;
-    } else if (hr != E_NOINTERFACE) {
-        PrintHr(L"QueryInterface(IAudioClient3)", hr);
-    }
-
-legacy_fallback:
-    REFERENCE_TIME defaultPeriod = 0;
-    REFERENCE_TIME minPeriod = 0;
-    hr = (*audioClient)->GetDevicePeriod(&defaultPeriod, &minPeriod);
-    if (FAILED(hr) || defaultPeriod <= 0)
-        defaultPeriod = 100000;
-
-    constexpr REFERENCE_TIME targetDuration = 300000;
-    const REFERENCE_TIME bufferDuration =
-        ((targetDuration + defaultPeriod - 1) / defaultPeriod) * defaultPeriod;
     hr = (*audioClient)->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK |
@@ -176,7 +99,7 @@ legacy_fallback:
         format,
         nullptr);
     if (FAILED(hr)) {
-        PrintHr(L"IAudioClient::Initialize(loopback,fallback)", hr);
+        PrintHr(L"IAudioClient::Initialize(loopback,event-driven)", hr);
         if (!reactivateAudioClient())
             return false;
         hr = (*audioClient)->Initialize(
@@ -212,9 +135,9 @@ legacy_fallback:
         std::wcout << L"Event handle unavailable; using polling fallback.\n";
         return true;
     }
-    std::wcout << L"IAudioClient fallback capture buffer request: "
+    std::wcout << L"Event-driven loopback capture; requesting "
                << bufferDuration / 10000
-               << L" ms (event-driven, 5 ms polling safety fallback)\n";
+               << L" ms buffer (5 ms target, aligned to engine period)\n";
     return true;
 }
 
