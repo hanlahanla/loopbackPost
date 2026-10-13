@@ -172,18 +172,14 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
 }
 
 // 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
-static double kDropBacklogMs = 60.0;
+static double kDropBacklogMs = 20.0;
 
-// 拥塞补偿以 5 ms 为最小操作单位。
-// 不是连续“吃掉”缓存，而是在收到拥塞事件时预先计算一张
-// “发送/丢弃”时间轴；后续每个 WASAPI packet 只按时间轴执行。
+// 拥塞补偿时“丢弃段”的最小粒度。
+// 固定 50% 丢弃比例：每个丢弃段配一个等大的发送段，交替排列，
+// 听感上像 2 倍速快进。丢弃段保持小粒度，避免听感上扎堆跳跃。
 static constexpr double kDropUnitMs = 5.0;
-static constexpr double kInitialCongestionIntervalMs = 1000.0;
-static constexpr double kMinCongestionIntervalMs = 100.0;
-static constexpr double kMaxRecoveryIntervalMs = 1000.0;
 // 延迟已经非常大时，直接把旧数据全部丢掉，避免用户长时间听到快进/跳跃。
-static constexpr double kDropAllBacklogMs = 2000.0;
-static constexpr double kCongestionIntervalEwmaAlpha = 0.35;
+static constexpr double kDropAllBacklogMs = 1000.0;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -1624,10 +1620,6 @@ int wmain(int argc, wchar_t* argv[])
         // 拥塞发生时预先算好的“发送/丢弃”时间轴。
         std::deque<CompensationSegment> compensationSchedule;
 
-        // 最近一次进入拥塞累计的时间，用于估算平均拥塞间隔。
-        bool haveLastCongestionTime = false;
-        auto lastCongestionTime = std::chrono::steady_clock::now();
-        double avgCongestionIntervalMs = kInitialCongestionIntervalMs;
         const auto clearCompensation = [&]() {
             dropFrames = 0;
             dropBacklogActive = false;
@@ -1656,106 +1648,28 @@ int wmain(int argc, wchar_t* argv[])
                 return;
             }
 
-            // 希望在最近几次拥塞的平均间隔内把欠账追回。
-            // 假设恢复窗口为 R，那么需要处理 B+R 的源音频，其中 B 为丢弃量，
-            // R 为实际继续播放的音频量，因此丢弃比例 = B / (B + R)。
-            const double recoveryMs =
-                std::max(
-                    kMinCongestionIntervalMs,
-                    std::min(
-                        kMaxRecoveryIntervalMs,
-                        avgCongestionIntervalMs));
-
-            uint64_t sendFrames = static_cast<uint64_t>(
-                static_cast<double>(format->nSamplesPerSec) *
-                recoveryMs / 1000.0);
-
-            if (sendFrames == 0)
-                sendFrames = unitFrames;
-
+            // 固定 50% 丢弃比例：每个丢弃段配一个等大的发送段，交替排列。
+            // 时间轴形如“发5ms、丢5ms、发5ms、丢5ms……”，听感上像 2 倍速快进。
+            // 需要补偿 dropFrames，就丢 dropFrames/unitFrames 轮，每轮丢 unitFrames。
             const uint64_t dropUnits = dropFrames / unitFrames;
             const uint64_t dropRemainder = dropFrames % unitFrames;
-            const uint64_t sendUnits = sendFrames / unitFrames;
-            const uint64_t sendRemainder = sendFrames % unitFrames;
-
-            const uint64_t totalActions =
-                dropUnits + (dropRemainder ? 1 : 0) +
-                sendUnits + (sendRemainder ? 1 : 0);
-
-            if (totalActions == 0)
-                return;
-
-            // 用 Bresenham/DDA 的方式把“丢”动作均匀撒进“发”动作之间。
-            // 这里先计算完整时间轴，再执行时间轴；不修改 WASAPI 的缓存内容。
-            // 典型结果类似：发10ms、丢5ms、发10ms、丢5ms……
             const uint64_t totalDropActions =
                 dropUnits + (dropRemainder ? 1 : 0);
-            const uint64_t totalSendActions =
-                sendUnits + (sendRemainder ? 1 : 0);
 
-            uint64_t dropIndex = 0;
-            uint64_t sendIndex = 0;
-            uint64_t previousDropCount = 0;
-            uint64_t previousSendCount = 0;
+            if (totalDropActions == 0)
+                return;
 
-            for (uint64_t i = 1; i <= totalActions; ++i) {
-                const uint64_t targetDropCount =
-                    (i * totalDropActions) / totalActions;
-                const uint64_t targetSendCount =
-                    (i * totalSendActions) / totalActions;
+            for (uint64_t i = 0; i < totalDropActions; ++i) {
+                // 发送段：与丢弃段等大，固定 unitFrames。
+                compensationSchedule.push_back({false, unitFrames});
 
-                if (targetDropCount > previousDropCount) {
-                    while (dropIndex < targetDropCount) {
-                        uint64_t framesForAction = unitFrames;
-                        if (dropIndex + 1 == totalDropActions && dropRemainder)
-                            framesForAction = dropRemainder;
-
-                        if (!compensationSchedule.empty() &&
-                            compensationSchedule.back().drop) {
-                            compensationSchedule.back().frames += framesForAction;
-                        } else {
-                            compensationSchedule.push_back({true, framesForAction});
-                        }
-                        ++dropIndex;
-                    }
-                }
-
-                if (targetSendCount > previousSendCount) {
-                    while (sendIndex < targetSendCount) {
-                        uint64_t framesForAction = unitFrames;
-                        if (sendIndex + 1 == totalSendActions && sendRemainder)
-                            framesForAction = sendRemainder;
-
-                        if (!compensationSchedule.empty() &&
-                            !compensationSchedule.back().drop) {
-                            compensationSchedule.back().frames += framesForAction;
-                        } else {
-                            compensationSchedule.push_back({false, framesForAction});
-                        }
-                        ++sendIndex;
-                    }
-                }
-
-                previousDropCount = targetDropCount;
-                previousSendCount = targetSendCount;
-            }
-
-            // 理论上所有动作都已经排入。若由于整数取整导致个别动作没有排入，
-            // 这里补到末尾，保证欠账一定能被完全消耗。
-            while (dropIndex < totalDropActions) {
+                // 丢弃段：前 totalDropActions-1 个都是 unitFrames，
+                // 最后一个把 remainder 补上，保证 dropFrames 被完全消耗。
                 uint64_t framesForAction = unitFrames;
-                if (dropIndex + 1 == totalDropActions && dropRemainder)
+                if (i + 1 == totalDropActions && dropRemainder)
                     framesForAction = dropRemainder;
-                compensationSchedule.push_back({true, framesForAction});
-                ++dropIndex;
-            }
 
-            while (sendIndex < totalSendActions) {
-                uint64_t framesForAction = unitFrames;
-                if (sendIndex + 1 == totalSendActions && sendRemainder)
-                    framesForAction = sendRemainder;
-                compensationSchedule.push_back({false, framesForAction});
-                ++sendIndex;
+                compensationSchedule.push_back({true, framesForAction});
             }
         };
 
@@ -1850,13 +1764,11 @@ int wmain(int argc, wchar_t* argv[])
                 }
 
                 ResetWriteStats();
-                streamConfirmed = false;
-                successfulChunks = 0;
-                clearCompensation();
-                haveLastCongestionTime = false;
-                avgCongestionIntervalMs = kInitialCongestionIntervalMs;
-                std::wcout
-                    << L"HTTP connected; waiting for audio writes...\n";
+                                streamConfirmed = false;
+                                successfulChunks = 0;
+                                clearCompensation();
+                                std::wcout
+                                    << L"HTTP connected; waiting for audio writes...\n";
             }
 
             const bool reconnectRequested =
@@ -1893,8 +1805,6 @@ int wmain(int argc, wchar_t* argv[])
                     serviceRetryDelay = false;
                     shortReconnectDelay = true;
                     clearCompensation();
-                    haveLastCongestionTime = false;
-                    avgCongestionIntervalMs = kInitialCongestionIntervalMs;
 
                     // Stop+Reset 丢弃当前捕获积压，并给服务端时间释放旧连接。
                     if (!stopAndFlushAudioCapture()) {
@@ -1903,8 +1813,6 @@ int wmain(int argc, wchar_t* argv[])
                     }
 
                     clearCompensation();
-                    haveLastCongestionTime = false;
-                    avgCongestionIntervalMs = kInitialCongestionIntervalMs;
                     ResetWriteStats();
                     continue;
                 }
@@ -2139,27 +2047,6 @@ int wmain(int argc, wchar_t* argv[])
                 // 把 WriteData 耗时转换成历史音频欠账，然后重新计算一张“发送/丢弃”时间轴。
                 if (g_blockedMs >= kDropBacklogMs) {
                     const double dropMs = g_blockedMs;
-                    const auto now = std::chrono::steady_clock::now();
-
-                    if (haveLastCongestionTime) {
-                        const double intervalMs =
-                            std::chrono::duration<double, std::milli>(
-                                now - lastCongestionTime).count();
-
-                        if (intervalMs > 0.0) {
-                            if (intervalMs < kMinCongestionIntervalMs) {
-                                avgCongestionIntervalMs = kMinCongestionIntervalMs;
-                            } else {
-                                avgCongestionIntervalMs =
-                                    avgCongestionIntervalMs *
-                                        (1.0 - kCongestionIntervalEwmaAlpha) +
-                                    intervalMs * kCongestionIntervalEwmaAlpha;
-                            }
-                        }
-                    }
-
-                    lastCongestionTime = now;
-                    haveLastCongestionTime = true;
 
                     const uint64_t newDropFrames =
                         static_cast<uint64_t>(
@@ -2190,7 +2077,7 @@ int wmain(int argc, wchar_t* argv[])
                         << L" ms; calculated "
                         << (dropAll
                                 ? L"full drop of old audio."
-                                : L"5 ms send/drop schedule.")
+                                : L"2x send/drop schedule.")
                         << L"; WriteData calls="
                         << g_writeCalls
                         << L", avg="
