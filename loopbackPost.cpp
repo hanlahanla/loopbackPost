@@ -41,17 +41,17 @@ static bool g_volumeUpPressed = false;
 static bool g_volumeDownPressed = false;
 static bool g_volumeMutePressed = false;
 
-// 单次写入超过 1 ms，才认为是实际发送阻塞并计入补偿欠账。
+// 单次写入超过 1 ms，计入写入耗时回退估算。
 static constexpr double kBlockedWriteMs = 1.0;
 
-// 本次连接内累计“实际阻塞”的毫秒数
+// 本次连接内累计超过阈值的写入耗时，仅在 WASAPI 时间戳不可用时补偿。
 static double g_blockedMs = 0.0;
 static uint64_t g_writeCalls = 0;
 static uint64_t g_writeOver1MsCalls = 0;
 static double g_writeMaxMs = 0.0;
 static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 
-// 累计被阻塞到这个程度后，丢掉 WASAPI 捕获缓冲中的音频
+// 允许的最大采集音频包年龄；超过后丢弃旧音频追赶实时。
 static double kDropBacklogMs = 20.0;
 
 // 拥塞补偿时“丢弃段”的最小粒度。
@@ -1154,7 +1154,7 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     if (argc >= 3) {
-        // 第2个参数是同步延迟ms
+        // 第2个参数是允许的最大采集音频年龄ms
         kDropBacklogMs = std::wcstod(argv[2], nullptr);
     }
 
@@ -1612,18 +1612,26 @@ int wmain(int argc, wchar_t* argv[])
         std::wcout
             << L"Press Enter to reconnect, Ctrl+C to stop.\n";
 
-        ok = true;
-
         std::vector<int16_t> pcm16;
         const bool serviceMode = (argc >= 2);
 
         bool connected = false;
         bool streamConfirmed = false; // 已持续成功写出多块音频数据
+        bool timestampWarningShown = false;
         int successfulChunks = 0;
         int autoReconnectAttempts = 0;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
         bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
         bool shortReconnectDelay = false; // 手动重连：等待 200 ms
+        LARGE_INTEGER qpcFrequency{};
+        if (!QueryPerformanceFrequency(&qpcFrequency) ||
+            qpcFrequency.QuadPart <= 0) {
+            PrintWinError(L"QueryPerformanceFrequency");
+            ok = false;
+            break;
+        }
+        ok = true;
+
         // 当前还需要从历史音频中跳过的旧帧总量。
         uint64_t dropFrames = 0;
         bool dropBacklogActive = false;
@@ -1887,13 +1895,14 @@ int wmain(int argc, wchar_t* argv[])
                 BYTE* data = nullptr;
                 UINT32 frames = 0;
                 DWORD flags = 0;
+                UINT64 qpcPosition = 0;
 
                 hr = captureClient->GetBuffer(
                     &data,
                     &frames,
                     &flags,
                     nullptr,
-                    nullptr);
+                    &qpcPosition);
 
                 if (FAILED(hr)) {
                     PrintHr(
@@ -1903,17 +1912,67 @@ int wmain(int argc, wchar_t* argv[])
                     break;
                 }
 
+                bool timestampAvailable =
+                    (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 &&
+                    qpcPosition != 0;
+                double packetAgeMs = 0.0;
+                if (timestampAvailable) {
+                    LARGE_INTEGER currentQpc{};
+                    if (!QueryPerformanceCounter(&currentQpc)) {
+                        PrintWinError(L"QueryPerformanceCounter");
+                        captureClient->ReleaseBuffer(frames);
+                        connected = false;
+                        break;
+                    }
+
+                    const double currentQpc100ns =
+                        static_cast<double>(currentQpc.QuadPart) *
+                        10000000.0 /
+                        static_cast<double>(qpcFrequency.QuadPart);
+                    packetAgeMs = std::max(
+                        0.0,
+                        (currentQpc100ns -
+                         static_cast<double>(qpcPosition)) /
+                            10000.0);
+                    const double excessAgeMs =
+                        packetAgeMs - kDropBacklogMs;
+                    dropFrames =
+                        excessAgeMs > 0.0
+                            ? static_cast<uint64_t>(std::ceil(
+                                  excessAgeMs *
+                                  format->nSamplesPerSec / 1000.0))
+                            : 0;
+                    if (dropFrames > 0) {
+                        if (!dropBacklogActive) {
+                            std::wcout
+                                << L"Audio packet age "
+                                << static_cast<long long>(packetAgeMs)
+                                << L" ms; dropping stale audio.\n";
+                        }
+                        dropBacklogActive = true;
+                    }
+                } else if (!timestampWarningShown) {
+                    std::wcerr
+                        << L"WASAPI packet timestamp unavailable; using write-time fallback for this capture session.\n";
+                    timestampWarningShown = true;
+                    dropFrames = 0;
+                    dropBacklogActive = false;
+                }
+
                 // 每个分片进来时，如果还有欠账，按 kDropUnitMs 粒度交替“丢/留”，
                 // 留的段累积到分片剩余大小后一次性发送；否则正常发送整个分片。
                 UINT32 frameOffset = 0;
                 bool packetHandled = false;
 
                 if (dropFrames > 0) {
-                    // 欠账太大时，直接丢弃欠账对应的旧帧，快速追上实时音频。
+                    // 欠账太大时，直接丢弃旧帧，快速追上实时音频。
                     const double backlogMs =
                         static_cast<double>(dropFrames) * 1000.0 /
                         static_cast<double>(format->nSamplesPerSec);
-                    if (backlogMs >= kDropAllBacklogMs) {
+                    if ((timestampAvailable &&
+                         packetAgeMs >= kDropAllBacklogMs) ||
+                        (!timestampAvailable &&
+                         backlogMs >= kDropAllBacklogMs)) {
                         const uint64_t dropCount = std::min<uint64_t>(
                             dropFrames,
                             static_cast<uint64_t>(frames));
@@ -2018,18 +2077,39 @@ int wmain(int argc, wchar_t* argv[])
                 if (g_blockedMs >= kDropBacklogMs) {
                     const double dropMs = g_blockedMs;
 
-                    const uint64_t newDropFrames =
-                        static_cast<uint64_t>(
-                            static_cast<double>(format->nSamplesPerSec) *
-                            dropMs / 1000.0);
+                    if (!timestampAvailable) {
+                        const uint64_t newDropFrames =
+                            static_cast<uint64_t>(
+                                static_cast<double>(format->nSamplesPerSec) *
+                                dropMs / 1000.0);
 
-                    dropFrames += newDropFrames;
-                    dropBacklogActive = true;
+                        dropFrames += newDropFrames;
+                        dropBacklogActive = true;
+                    }
 
                     const double backlogMs =
                         static_cast<double>(dropFrames) * 1000.0 /
                         static_cast<double>(format->nSamplesPerSec);
-
+                    double captureQueueAgeMs = packetAgeMs;
+                    if (timestampAvailable) {
+                        LARGE_INTEGER currentQpc{};
+                        if (QueryPerformanceCounter(&currentQpc)) {
+                            const double currentQpc100ns =
+                                static_cast<double>(currentQpc.QuadPart) *
+                                10000000.0 /
+                                static_cast<double>(qpcFrequency.QuadPart);
+                            const double packetEndQpc100ns =
+                                static_cast<double>(qpcPosition) +
+                                static_cast<double>(frames) * 10000000.0 /
+                                    format->nSamplesPerSec;
+                            captureQueueAgeMs = std::max(
+                                0.0,
+                                (currentQpc100ns - packetEndQpc100ns) /
+                                    10000.0);
+                        } else {
+                            PrintWinError(L"QueryPerformanceCounter");
+                        }
+                    }
                     const double averageWriteMs =
                         g_writeCalls > 0
                             ? dropMs / static_cast<double>(g_writeCalls)
@@ -2038,9 +2118,19 @@ int wmain(int argc, wchar_t* argv[])
                     std::wcout
                         << L"Network congested (writes blocked "
                         << static_cast<long long>(dropMs)
-                        << L" ms); queued "
-                        << static_cast<long long>(backlogMs)
-                        << L" ms; "
+                        << L" ms); ";
+                    if (timestampAvailable) {
+                        std::wcout
+                            << L"queued audio age "
+                            << static_cast<long long>(captureQueueAgeMs)
+                            << L" ms; ";
+                    } else {
+                        std::wcout
+                            << L"estimated queued "
+                            << static_cast<long long>(backlogMs)
+                            << L" ms; ";
+                    }
+                    std::wcout
                         << L"WriteData calls="
                         << g_writeCalls
                         << L", avg="
