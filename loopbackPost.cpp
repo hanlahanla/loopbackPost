@@ -42,7 +42,7 @@ static bool g_volumeDownPressed = false;
 static bool g_volumeMutePressed = false;
 
 // 单次写入超过 1 ms，才认为是实际发送阻塞并计入补偿欠账。
-static constexpr double kBlockedWriteMs = 5.0;
+static constexpr double kBlockedWriteMs = 1.0;
 
 // 本次连接内累计“实际阻塞”的毫秒数
 static double g_blockedMs = 0.0;
@@ -50,6 +50,24 @@ static uint64_t g_writeCalls = 0;
 static uint64_t g_writeOver1MsCalls = 0;
 static double g_writeMaxMs = 0.0;
 static DWORD g_lastWinHttpError = ERROR_SUCCESS;
+
+// 累计被阻塞到这个程度后，丢掉 WASAPI 捕获缓冲中的音频
+static double kDropBacklogMs = 20.0;
+
+// 拥塞补偿时“丢弃段”的最小粒度。
+// 每个分片丢一半：按kDropUnitMs粒度交替丢,然后发送留下的部分
+static constexpr double kDropUnitMs = 2.0;
+
+// HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
+static constexpr int kMaxAutoReconnectAttempts = 3;
+
+// 使用命令行 URL 启动时，3 次自动重连全部失败后继续后台运行，
+// 每 10 秒重新尝试一次，适合开机启动；交互模式仍等待 Enter。
+static constexpr auto kServiceRetryDelay = std::chrono::seconds(10);
+
+// 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
+static constexpr auto kCongestionReconnectDelay = std::chrono::milliseconds(200);
+
 
 static void ResetWriteStats()
 {
@@ -170,26 +188,6 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
                << L" ms\n";
     return true;
 }
-
-// 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
-static double kDropBacklogMs = 20.0;
-
-// 拥塞补偿时“丢弃段”的最小粒度。
-// 每个分片丢一半：按kDropUnitMs粒度交替丢,然后发送留下的部分
-static constexpr double kDropUnitMs = 1.0;
-// 延迟已经非常大时，直接把旧数据全部丢掉，避免用户长时间听到快进/跳跃。
-static constexpr double kDropAllBacklogMs = 1000.0;
-
-// HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
-static constexpr int kMaxAutoReconnectAttempts = 3;
-
-// 使用命令行 URL 启动时，3 次自动重连全部失败后继续后台运行，
-// 每 10 秒重新尝试一次，适合开机启动；交互模式仍等待 Enter。
-static constexpr auto kServiceRetryDelay = std::chrono::seconds(10);
-
-// 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
-static constexpr auto kCongestionReconnectDelay =
-    std::chrono::milliseconds(200);
 
 BOOL WINAPI ConsoleHandler(DWORD type)
 {
@@ -1890,30 +1888,6 @@ int wmain(int argc, wchar_t* argv[])
                 UINT32 frameOffset = 0;
 
                 if (dropFrames > 0) {
-                    // 欠账太大时，直接丢弃整个分片，快速清掉旧音频。
-                    const double backlogMs =
-                        static_cast<double>(dropFrames) * 1000.0 /
-                        static_cast<double>(format->nSamplesPerSec);
-                    if (backlogMs >= kDropAllBacklogMs) {
-                        dropFrames -= std::min<uint64_t>(
-                            dropFrames,
-                            static_cast<uint64_t>(frames));
-                        if (dropFrames == 0 && dropBacklogActive) {
-                            std::wcout << L"Drop backlog cleared.\n";
-                            dropBacklogActive = false;
-                        }
-                        captureClient->ReleaseBuffer(frames);
-                        if (!connected || g_stop.load())
-                            break;
-                        hr = captureClient->GetNextPacketSize(&packetFrames);
-                        if (FAILED(hr)) {
-                            PrintHr(L"IAudioCaptureClient::GetNextPacketSize", hr);
-                            connected = false;
-                            break;
-                        }
-                        continue;
-                    }
-
                     // 本分片丢弃量 = min(分片一半, 剩余欠账)。
                     const uint64_t dropThisPacket = std::min<uint64_t>(
                         static_cast<uint64_t>(frames) / 2,
@@ -2008,9 +1982,6 @@ int wmain(int argc, wchar_t* argv[])
                         static_cast<double>(dropFrames) * 1000.0 /
                         static_cast<double>(format->nSamplesPerSec);
 
-                    const bool dropAll =
-                        backlogMs >= kDropAllBacklogMs;
-
                     const double averageWriteMs =
                         g_writeCalls > 0
                             ? dropMs / static_cast<double>(g_writeCalls)
@@ -2021,11 +1992,8 @@ int wmain(int argc, wchar_t* argv[])
                         << static_cast<long long>(dropMs)
                         << L" ms); queued "
                         << static_cast<long long>(backlogMs)
-                        << L" ms; calculated "
-                        << (dropAll
-                                ? L"full drop of old audio."
-                                : L"1ms interleaved drop/send.")
-                        << L"; WriteData calls="
+                        << L" ms; "
+                        << L"WriteData calls="
                         << g_writeCalls
                         << L", avg="
                         << averageWriteMs
