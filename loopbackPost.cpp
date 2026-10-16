@@ -51,8 +51,12 @@ static uint64_t g_writeOver1MsCalls = 0;
 static double g_writeMaxMs = 0.0;
 static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 
-// 累计被阻塞到这个程度后，开始以 2 倍速处理 PCM 来追赶延迟
+// 累计被阻塞到这个程度后，丢掉 WASAPI 捕获缓冲中的音频
 static double kDropBacklogMs = 20.0;
+
+// 拥塞补偿时“丢弃段”的最小粒度。
+// 每个分片丢一半：按kDropUnitMs粒度交替丢,然后发送留下的部分
+static constexpr double kDropUnitMs = 2.5;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -1602,15 +1606,20 @@ int wmain(int argc, wchar_t* argv[])
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
         bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
         bool shortReconnectDelay = false; // 手动重连：等待 200 ms
-        // 还需通过 2 倍速播放跳过的输入帧数，用于追赶网络积压。
+        // 当前还需要从历史音频中跳过的旧帧总量。
         uint64_t dropFrames = 0;
         bool dropBacklogActive = false;
-        bool keepNextFrame = true;
+
+        // 丢弃粒度（1ms）对应的帧数。
+        const uint64_t dropUnitFrames = std::max<uint64_t>(
+            1,
+            static_cast<uint64_t>(
+                static_cast<double>(format->nSamplesPerSec) *
+                kDropUnitMs / 1000.0));
 
         const auto clearCompensation = [&]() {
             dropFrames = 0;
             dropBacklogActive = false;
-            keepNextFrame = true;
         };
 
         // 发送一段 PCM：转换 + 写入 + 计数。返回是否成功。
@@ -1874,62 +1883,75 @@ int wmain(int argc, wchar_t* argv[])
                     break;
                 }
 
+                // 每个分片进来时，如果还有欠账，按 kDropUnitMs 粒度交替“丢/留”，
+                // 留的段累积到分片剩余大小后一次性发送；否则正常发送整个分片。
+                UINT32 frameOffset = 0;
+
                 if (dropFrames > 0) {
-                    std::vector<BYTE> acceleratedPcm;
-                    acceleratedPcm.reserve(
+                    // 本分片丢弃量 = min(分片一半, 剩余欠账)。
+                    const uint64_t dropThisPacket = std::min<uint64_t>(
+                        static_cast<uint64_t>(frames) / 2,
+                        dropFrames);
+
+                    // 按 kDropUnitMs 粒度交替丢/留，留的段累积到 sendTarget 再发。
+                    std::vector<BYTE> sendAccum;
+                    sendAccum.reserve(
                         static_cast<size_t>(frames) * format->nBlockAlign);
-                    UINT32 outputFrames = 0;
-                    UINT32 frameOffset = 0;
+                    uint64_t sendAccumFrames = 0;
+                    uint64_t dropped = 0;
+                    bool dropNext = true;
 
-                    for (; frameOffset < frames && dropFrames > 0; ++frameOffset) {
-                        if (keepNextFrame) {
-                            if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) &&
-                                data != nullptr) {
-                                const BYTE* frameData =
-                                    data + static_cast<size_t>(frameOffset) *
-                                               format->nBlockAlign;
-                                acceleratedPcm.insert(
-                                    acceleratedPcm.end(),
-                                    frameData,
-                                    frameData + format->nBlockAlign);
+                    while (frameOffset < frames && connected && !g_stop.load()) {
+                        const UINT32 take = static_cast<UINT32>(
+                            std::min<uint64_t>(
+                                dropUnitFrames,
+                                static_cast<uint64_t>(frames) - frameOffset));
+
+                        if (dropNext && dropped < dropThisPacket) {
+                            const UINT32 dropCount = static_cast<UINT32>(
+                                std::min<uint64_t>(
+                                    take,
+                                    dropThisPacket - dropped));
+                            dropped += dropCount;
+
+                            const UINT32 sendCount = take - dropCount;
+                            if (sendCount > 0 && data != nullptr) {
+                                const UINT32 sendOffset = frameOffset + dropCount;
+                                sendAccum.insert(
+                                    sendAccum.end(),
+                                    data + static_cast<size_t>(sendOffset) * format->nBlockAlign,
+                                    data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
                             }
-                            ++outputFrames;
+                            sendAccumFrames += sendCount;
                         } else {
-                            --dropFrames;
+                            // 留这段：累积到 sendAccum。
+                            if (data != nullptr) {
+                                sendAccum.insert(
+                                    sendAccum.end(),
+                                    data + static_cast<size_t>(frameOffset) * format->nBlockAlign,
+                                    data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
+                            }
+                            sendAccumFrames += take;
                         }
-                        keepNextFrame = !keepNextFrame;
+
+                        frameOffset += take;
+                        dropNext = !dropNext;
                     }
 
-                    // 欠账在分片中途清零后，剩余帧恢复正常速率。
-                    const UINT32 remainingFrames = frames - frameOffset;
-                    if (remainingFrames > 0) {
-                        if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) &&
-                            data != nullptr) {
-                            const BYTE* remainingData =
-                                data + static_cast<size_t>(frameOffset) *
-                                           format->nBlockAlign;
-                            acceleratedPcm.insert(
-                                acceleratedPcm.end(),
-                                remainingData,
-                                remainingData +
-                                    static_cast<size_t>(remainingFrames) *
-                                        format->nBlockAlign);
-                        }
-                        outputFrames += remainingFrames;
-                    }
+                    dropFrames -= dropped;
 
-                    if (connected && outputFrames > 0 &&
-                        !sendPcmSegment(
-                            acceleratedPcm.empty()
-                                ? nullptr
-                                : acceleratedPcm.data(),
-                            outputFrames,
-                            flags)) {
-                        connected = false;
+                    // 发送累积的留段。
+                    if (connected && sendAccumFrames > 0) {
+                        if (!sendPcmSegment(
+                                sendAccum.data(),
+                                static_cast<UINT32>(sendAccumFrames),
+                                flags)) {
+                            connected = false;
+                        }
                     }
 
                     if (dropFrames == 0 && dropBacklogActive) {
-                        std::wcout << L"Acceleration backlog cleared.\n";
+                        std::wcout << L"Drop backlog cleared.\n";
                         dropBacklogActive = false;
                     }
                 } else {
