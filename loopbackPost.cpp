@@ -56,7 +56,7 @@ static double kDropBacklogMs = 20.0;
 
 // 拥塞补偿时“丢弃段”的最小粒度。
 // 每个分片丢一半：按kDropUnitMs粒度交替丢,然后发送留下的部分
-static constexpr double kDropUnitMs = 2.5;
+static double kDropUnitMs = 5;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -1150,6 +1150,11 @@ int wmain(int argc, wchar_t* argv[])
     if (argc >= 3) {
         // 第二个参数是同步延迟ms
         kDropBacklogMs = std::wcstod(argv[2], nullptr);
+    }
+
+    if (argc >= 4) {
+        // 第三个参数是丢掉的ms的大小和间隔
+        kDropUnitMs = std::wcstod(argv[3], nullptr);
     }
 
     if (url.empty()) {
