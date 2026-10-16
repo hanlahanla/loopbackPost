@@ -1136,6 +1136,10 @@ static bool ConvertToS16(
 
 int wmain(int argc, wchar_t* argv[])
 {
+    // 设置成高优先级
+    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+        PrintWinError(L"SetPriorityClass(HIGH_PRIORITY_CLASS)");
+
     std::wstring url;
 
     if (argc >= 2) {
