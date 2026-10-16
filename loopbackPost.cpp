@@ -57,6 +57,8 @@ static double kDropBacklogMs = 20.0;
 // 拥塞补偿时“丢弃段”的最小粒度。
 // 每个分片丢一半：按kDropUnitMs粒度交替丢,然后发送留下的部分
 static double kDropUnitMs = 5;
+// 延迟已经非常大时，直接把旧数据全部丢掉，避免用户长时间听到快进/跳跃。
+static double kDropAllBacklogMs = 500.0;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -1152,13 +1154,18 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     if (argc >= 3) {
-        // 第二个参数是同步延迟ms
+        // 第2个参数是同步延迟ms
         kDropBacklogMs = std::wcstod(argv[2], nullptr);
     }
 
     if (argc >= 4) {
-        // 第三个参数是丢掉的ms的大小和间隔
+        // 第3个参数是丢一半时每次丢掉的ms的大小和间隔
         kDropUnitMs = std::wcstod(argv[3], nullptr);
+    }
+    
+    if (argc >= 5) {
+        // 第4个参数是达到多少ms丢全部
+        kDropAllBacklogMs = std::wcstod(argv[4], nullptr);
     }
 
     if (url.empty()) {
@@ -1318,6 +1325,7 @@ int wmain(int argc, wchar_t* argv[])
         // 当前实际使用的地址。302 时优先使用 Location；如果服务端只做 8080 -> 8880，
         // 也会自动切换到 8880。
         UrlParts activeParts = finalParts;
+        bool hasStreamedSuccessfully = false;
 
         if (!StartKeyboardHook())
             break;
@@ -1388,7 +1396,8 @@ int wmain(int argc, wchar_t* argv[])
                     }
                 }
                 closeHttp();
-                if (IsConnectionFailure(failureError) &&
+                if (!hasStreamedSuccessfully &&
+                    IsConnectionFailure(failureError) &&
                     AdvancePortFallback(activeParts)) {
                     std::wcout
                         << L"Cannot connect; trying port "
@@ -1656,6 +1665,7 @@ int wmain(int argc, wchar_t* argv[])
                     ++successfulChunks;
                     if (!streamConfirmed && successfulChunks >= 3) {
                         streamConfirmed = true;
+                        hasStreamedSuccessfully = true;
                         autoReconnectAttempts = 0;
                         serviceRetryDelay = false;
                         retryAfterDelay = false;
@@ -1689,6 +1699,7 @@ int wmain(int argc, wchar_t* argv[])
             ++successfulChunks;
             if (!streamConfirmed && successfulChunks >= 3) {
                 streamConfirmed = true;
+                hasStreamedSuccessfully = true;
                 autoReconnectAttempts = 0;
                 serviceRetryDelay = false;
                 retryAfterDelay = false;
@@ -1897,6 +1908,20 @@ int wmain(int argc, wchar_t* argv[])
                 UINT32 frameOffset = 0;
 
                 if (dropFrames > 0) {
+                    // 欠账太大时，直接丢弃整个分片，快速清掉旧音频。
+                    const double backlogMs =
+                        static_cast<double>(dropFrames) * 1000.0 /
+                        static_cast<double>(format->nSamplesPerSec);
+                    if (backlogMs >= kDropAllBacklogMs) {
+                        dropFrames -= std::min<uint64_t>(
+                            dropFrames,
+                            static_cast<uint64_t>(frames));
+                        if (dropFrames == 0 && dropBacklogActive) {
+                            std::wcout << L"Drop backlog cleared.\n";
+                            dropBacklogActive = false;
+                        }
+                    }
+
                     // 本分片丢弃量 = min(分片一半, 剩余欠账)。
                     const uint64_t dropThisPacket = std::min<uint64_t>(
                         static_cast<uint64_t>(frames) / 2,
@@ -2060,7 +2085,8 @@ int wmain(int argc, wchar_t* argv[])
                                     << (activeParts.https ? L"https://" : L"http://")
                                     << activeParts.host << L":" << activeParts.port
                                     << activeParts.path << L"\n";
-                            } else if (AdvancePortFallback(activeParts)) {
+                            } else if (!hasStreamedSuccessfully &&
+                                       AdvancePortFallback(activeParts)) {
                                 portFallbackApplied = true;
                                 std::wcout
                                     << L"HTTP redirect detected; trying port "
@@ -2070,7 +2096,8 @@ int wmain(int argc, wchar_t* argv[])
                     }
                 }
 
-                if (!portFallbackApplied &&
+                if (!hasStreamedSuccessfully &&
+                    !portFallbackApplied &&
                     IsConnectionFailure(g_lastWinHttpError) &&
                     AdvancePortFallback(activeParts)) {
                     std::wcout
