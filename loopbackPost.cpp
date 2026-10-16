@@ -1906,92 +1906,106 @@ int wmain(int argc, wchar_t* argv[])
                 // 每个分片进来时，如果还有欠账，按 kDropUnitMs 粒度交替“丢/留”，
                 // 留的段累积到分片剩余大小后一次性发送；否则正常发送整个分片。
                 UINT32 frameOffset = 0;
+                bool packetHandled = false;
 
                 if (dropFrames > 0) {
-                    // 欠账太大时，直接丢弃整个分片，快速清掉旧音频。
+                    // 欠账太大时，直接丢弃欠账对应的旧帧，快速追上实时音频。
                     const double backlogMs =
                         static_cast<double>(dropFrames) * 1000.0 /
                         static_cast<double>(format->nSamplesPerSec);
                     if (backlogMs >= kDropAllBacklogMs) {
-                        dropFrames -= std::min<uint64_t>(
+                        const uint64_t dropCount = std::min<uint64_t>(
                             dropFrames,
                             static_cast<uint64_t>(frames));
-                        if (dropFrames == 0 && dropBacklogActive) {
-                            std::wcout << L"Drop backlog cleared.\n";
-                            dropBacklogActive = false;
-                        }
-                    }
+                        dropFrames -= dropCount;
+                        packetHandled = true;
 
-                    // 本分片丢弃量 = min(分片一半, 剩余欠账)。
-                    const uint64_t dropThisPacket = std::min<uint64_t>(
-                        static_cast<uint64_t>(frames) / 2,
-                        dropFrames);
-
-                    // 按 kDropUnitMs 粒度交替丢/留，留的段累积到 sendTarget 再发。
-                    std::vector<BYTE> sendAccum;
-                    sendAccum.reserve(
-                        static_cast<size_t>(frames) * format->nBlockAlign);
-                    uint64_t sendAccumFrames = 0;
-                    uint64_t dropped = 0;
-                    bool dropNext = true;
-
-                    while (frameOffset < frames && connected && !g_stop.load()) {
-                        const UINT32 take = static_cast<UINT32>(
-                            std::min<uint64_t>(
-                                dropUnitFrames,
-                                static_cast<uint64_t>(frames) - frameOffset));
-
-                        if (dropNext && dropped < dropThisPacket) {
-                            const UINT32 dropCount = static_cast<UINT32>(
-                                std::min<uint64_t>(
-                                    take,
-                                    dropThisPacket - dropped));
-                            dropped += dropCount;
-
-                            const UINT32 sendCount = take - dropCount;
-                            if (sendCount > 0 && data != nullptr) {
-                                const UINT32 sendOffset = frameOffset + dropCount;
-                                sendAccum.insert(
-                                    sendAccum.end(),
-                                    data + static_cast<size_t>(sendOffset) * format->nBlockAlign,
-                                    data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
-                            }
-                            sendAccumFrames += sendCount;
-                        } else {
-                            // 留这段：累积到 sendAccum。
-                            if (data != nullptr) {
-                                sendAccum.insert(
-                                    sendAccum.end(),
-                                    data + static_cast<size_t>(frameOffset) * format->nBlockAlign,
-                                    data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
-                            }
-                            sendAccumFrames += take;
-                        }
-
-                        frameOffset += take;
-                        dropNext = !dropNext;
-                    }
-
-                    dropFrames -= dropped;
-
-                    // 发送累积的留段。
-                    if (connected && sendAccumFrames > 0) {
-                        if (!sendPcmSegment(
-                                sendAccum.data(),
-                                static_cast<UINT32>(sendAccumFrames),
+                        const UINT32 remainingFrames =
+                            frames - static_cast<UINT32>(dropCount);
+                        if (remainingFrames > 0 &&
+                            !sendPcmSegment(
+                                data != nullptr
+                                    ? data + static_cast<size_t>(dropCount) *
+                                                 format->nBlockAlign
+                                    : nullptr,
+                                remainingFrames,
                                 flags)) {
                             connected = false;
                         }
                     }
 
-                    if (dropFrames == 0 && dropBacklogActive) {
-                        std::wcout << L"Drop backlog cleared.\n";
-                        dropBacklogActive = false;
+                    if (!packetHandled) {
+                        // 本分片丢弃量 = min(分片一半, 剩余欠账)。
+                        const uint64_t dropThisPacket = std::min<uint64_t>(
+                            static_cast<uint64_t>(frames) / 2,
+                            dropFrames);
+
+                        // 按 kDropUnitMs 粒度交替丢/留，留的段累积到 sendAccum。
+                        std::vector<BYTE> sendAccum;
+                        sendAccum.reserve(
+                            static_cast<size_t>(frames) * format->nBlockAlign);
+                        uint64_t sendAccumFrames = 0;
+                        uint64_t dropped = 0;
+                        bool dropNext = true;
+
+                        while (frameOffset < frames && connected && !g_stop.load()) {
+                            const UINT32 take = static_cast<UINT32>(
+                                std::min<uint64_t>(
+                                    dropUnitFrames,
+                                    static_cast<uint64_t>(frames) - frameOffset));
+
+                            if (dropNext && dropped < dropThisPacket) {
+                                const UINT32 dropCount = static_cast<UINT32>(
+                                    std::min<uint64_t>(
+                                        take,
+                                        dropThisPacket - dropped));
+                                dropped += dropCount;
+
+                                const UINT32 sendCount = take - dropCount;
+                                if (sendCount > 0 && data != nullptr) {
+                                    const UINT32 sendOffset = frameOffset + dropCount;
+                                    sendAccum.insert(
+                                        sendAccum.end(),
+                                        data + static_cast<size_t>(sendOffset) * format->nBlockAlign,
+                                        data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
+                                }
+                                sendAccumFrames += sendCount;
+                            } else {
+                                // 留这段：累积到 sendAccum。
+                                if (data != nullptr) {
+                                    sendAccum.insert(
+                                        sendAccum.end(),
+                                        data + static_cast<size_t>(frameOffset) * format->nBlockAlign,
+                                        data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
+                                }
+                                sendAccumFrames += take;
+                            }
+
+                            frameOffset += take;
+                            dropNext = !dropNext;
+                        }
+
+                        dropFrames -= dropped;
+
+                        // 发送累积的留段。
+                        if (connected && sendAccumFrames > 0) {
+                            if (!sendPcmSegment(
+                                    sendAccum.data(),
+                                    static_cast<UINT32>(sendAccumFrames),
+                                    flags)) {
+                                connected = false;
+                            }
+                        }
                     }
                 } else {
                     // 无欠账，正常发送整个分片。
                     if (!sendPcmSegment(data, frames, flags))
                         connected = false;
+                }
+
+                if (dropFrames == 0 && dropBacklogActive) {
+                    std::wcout << L"Drop backlog cleared.\n";
+                    dropBacklogActive = false;
                 }
 
                 captureClient->ReleaseBuffer(frames);
